@@ -1,233 +1,209 @@
 # worker.py
-import sys
-if sys.platform == "win32":
-    import asyncio
-    try:
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    except Exception:
-        pass
-
 import os
 import time
 import logging
 import asyncio
-from dotenv import load_dotenv
+from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 
 from utils import (
     render_page_get_text,
-    extract_submit_info,
-    download_file_if_needed,
+    download_file,
+    transcribe_with_whisper_local,
     try_simple_compute,
-    llm_solve_if_needed,
-    extract_answer_from_page,
-    find_audio_links,
-    download_audio,
-    transcribe_audio_path,
-    transcribe_audio_via_openai,
+    find_first_csv_file_in_downloads,
+    extract_number_from_text,
+    compute_answer_from_csv,
 )
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("worker")
+logger.setLevel(logging.INFO)
 
-OVERALL_TIMEOUT = 170  # seconds
+# Global time limit (seconds) from initial POST — must be < 180
+OVERALL_TIMEOUT = 170
 
 
-async def handle_quiz_request(email: str, secret: str, url: str):
-    start_time = time.time()
-    cur_url = url
-    current_secret = secret
-    session = httpx.AsyncClient(timeout=httpx.Timeout(60.0))
+async def _post_json(url: str, payload: dict, timeout: int = 30) -> Optional[dict]:
+    """
+    Simple POST JSON helper. We assume `url` is a proper absolute URL.
+    """
+    logger.info(f"_post_json: POST {url!r} with keys {list(payload.keys())}")
     try:
-        while cur_url and (time.time() - start_time) < OVERALL_TIMEOUT:
-            logger.info("Solving URL: %s", cur_url)
-
-            # Render page
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, json=payload, follow_redirects=True)
+            resp.raise_for_status()
             try:
-                page_html, page_text = await render_page_get_text(cur_url, wait_for=5.0)
-            except Exception as e:
-                logger.exception("render_page_get_text failed for %s: %s", cur_url, e)
-                break
-
-            # Extract submit info
-            try:
-                submit_info = extract_submit_info(page_html, cur_url, page_text=page_text)
-            except Exception as e:
-                logger.exception("extract_submit_info failed: %s", e)
-                break
-
-            if not submit_info:
-                logger.warning("Submit info not found. Stopping.")
-                break
-
-            submit_url = submit_info.get("submit_url")
-            if not submit_url:
-                logger.warning("No submit_url found. submit_candidates=%s", submit_info.get("submit_candidates"))
-                break
-
-            # Download linked files
-            linked_files = submit_info.get("linked_files", [])
-            downloaded = []
-            for f_url in linked_files:
-                try:
-                    p = await download_file_if_needed(f_url, session=session)
-                    if p:
-                        downloaded.append(p)
-                except Exception as e:
-                    logger.exception("Failed to download %s: %s", f_url, e)
-
-            # Heuristics
-            try:
-                answer = try_simple_compute(page_html, page_text, cur_url)
-            except Exception as e:
-                logger.exception("try_simple_compute raised: %s", e)
-                answer = None
-
-            # LLM fallback
-            if answer is None:
-                try:
-                    answer = await llm_solve_if_needed(page_text, downloaded)
-                except Exception as e:
-                    logger.exception("LLM solver failed: %s", e)
-                    answer = None
-
-            # Explicit extraction
-            candidate_secret = None
-            if answer is None:
-                try:
-                    extracted = extract_answer_from_page(page_html, page_text)
-                    if extracted is not None:
-                        answer = extracted
-                        logger.info("Extracted answer from page: %s", str(answer))
-                except Exception as e:
-                    logger.exception("extract_answer_from_page failed: %s", e)
-
-            # AUDIO: detect and download audio; prefer cloud transcription if key present
-            audio_transcript = None
-            try:
-                audio_links = find_audio_links(page_html, cur_url)
-                if audio_links:
-                    logger.info("Found audio links: %s", audio_links)
-                    for al in audio_links:
-                        try:
-                            audio_path = await download_audio(al, session=session)
-                            if audio_path:
-                                logger.info("Downloaded audio to %s, transcribing...", audio_path)
-                                # prefer cloud transcription if OPENAI_API_KEY present
-                                txt = None
-                                if os.getenv("OPENAI_API_KEY"):
-                                    try:
-                                        txt = await asyncio.to_thread(transcribe_audio_via_openai, audio_path)
-                                        logger.info("OpenAI transcription (cloud) result: %s", txt)
-                                    except Exception as e:
-                                        logger.exception("OpenAI transcription failed: %s", e)
-                                # fallback to local transcription
-                                if not txt:
-                                    try:
-                                        txt = await asyncio.to_thread(transcribe_audio_path, audio_path)
-                                        logger.info("Local transcription (fallback) result: %s", txt)
-                                    except Exception as e:
-                                        logger.exception("Local transcription failed: %s", e)
-                                if txt:
-                                    audio_transcript = txt
-                                    break
-                        except Exception as e:
-                            logger.exception("Audio download/transcribe failed for %s: %s", al, e)
+                return resp.json()
             except Exception:
-                pass
-
-            # If transcription found and no answer, take it as candidate secret
-            if not answer and audio_transcript:
-                candidate_secret = audio_transcript.strip()
-                logger.info("Using audio transcription as candidate_secret: %s", candidate_secret)
-
-            # If extracted answer is non-empty string, it may be a candidate secret
-            if isinstance(answer, str) and answer.strip():
-                candidate_secret = answer.strip()
-
-            if answer is None:
-                answer = ""
-
-            payload = {"email": email, "secret": current_secret, "url": cur_url, "answer": answer}
-            logger.info("Submitting to %s with payload keys: %s", submit_url, list(payload.keys()))
-
-            # Submit
-            try:
-                resp = await session.post(submit_url, json=payload, timeout=httpx.Timeout(60.0))
-            except Exception as e:
-                logger.exception("Submit POST failed: %s", e)
-                break
-
-            if resp.status_code not in (200, 201):
-                logger.warning("Submit returned status %s; body: %s", resp.status_code, getattr(resp, "text", "<no body>"))
-                break
-
-            try:
-                body = resp.json()
-            except Exception as e:
-                logger.exception("Invalid JSON response from submit endpoint: %s", e)
-                break
-
-            logger.info("Submit response: %s", body)
-
-            # Handle secret mismatch: follow grader-provided next URL if present (honor delay), else one-time retry with candidate_secret
-            if body.get("correct") is False and isinstance(body.get("reason"), str) and "Secret mismatch" in body.get("reason"):
-                next_url = body.get("url")
-                delay = body.get("delay") or 0
-                if next_url:
-                    try:
-                        delay_val = float(delay)
-                    except Exception:
-                        delay_val = 0
-                    logger.info("Server reported Secret mismatch and provided next URL. Waiting %s seconds then following %s", delay_val, next_url)
-                    if delay_val > 0:
-                        await asyncio.sleep(delay_val)
-                    cur_url = next_url
-                    continue
-
-                # No next URL -> retry once with candidate_secret if useful
-                cand = None
-                if candidate_secret:
-                    cand = " ".join(candidate_secret.split()).strip()
-                if cand and cand != current_secret:
-                    logger.info("Secret mismatch and no next URL. Retrying submit once with candidate secret.")
-                    current_secret = cand
-                    payload_retry = {"email": email, "secret": current_secret, "url": cur_url, "answer": answer}
-                    try:
-                        resp2 = await session.post(submit_url, json=payload_retry, timeout=httpx.Timeout(60.0))
-                    except Exception as e:
-                        logger.exception("Retry submit POST failed: %s", e)
-                        break
-
-                    if resp2.status_code not in (200, 201):
-                        logger.warning("Retry submit returned status %s; body: %s", resp2.status_code, getattr(resp2, "text", "<no body>"))
-                        break
-
-                    try:
-                        body2 = resp2.json()
-                    except Exception as e:
-                        logger.exception("Invalid JSON on retry response: %s", e)
-                        break
-
-                    logger.info("Retry submit response: %s", body2)
-                    body = body2
-                else:
-                    logger.warning("Secret mismatch: no usable candidate secret to retry and no next URL. Stopping.")
-                    break
-
-            # If correct and next URL, follow it
-            if body.get("correct") is True and body.get("url"):
-                cur_url = body["url"]
-                await asyncio.sleep(0.1)
-                continue
-            else:
-                break
-
-    finally:
+                return {"_http_error": False, "raw_text": resp.text}
+    except httpx.HTTPStatusError as e:
         try:
-            await session.aclose()
+            body = e.response.text
         except Exception:
-            pass
-        logger.info("Finished processing %s", url)
+            body = None
+        logger.warning(f"_post_json http status error {e.response.status_code}: {body}")
+        return {"_http_error": True, "status_code": e.response.status_code, "body": body}
+    except Exception:
+        logger.exception("_post_json failed")
+        return {"_http_error": True, "message": "post_failed"}
+
+
+async def handle_quiz_request(email: str, secret: str, start_url: str):
+    """
+    Main worker entrypoint. Called as a background task by main.py.
+    Follows the quiz sequence until there is no next URL or timeout.
+    """
+    logger.info(f"Worker START: email={email!r} url={start_url!r}")
+    logger.info(f"Solving URL: {start_url}")
+    deadline = time.time() + OVERALL_TIMEOUT
+    current_url = start_url
+
+    try:
+        while current_url and time.time() < deadline:
+            logger.info(f"Solving URL: {current_url}")
+
+            # 1) Render page and get HTML
+            try:
+                page_html = await render_page_get_text(current_url, timeout=30)
+            except Exception:
+                logger.exception("render_page_get_text failed")
+                break
+
+            # 2) quick deterministic compute from HTML (tables etc.)
+            numeric_answer = try_simple_compute(page_html)
+            candidate_secret = None
+
+            # 3) find and download CSV if linked
+            import re
+            csv_links = []
+            for m in re.finditer(r'href=["\']([^"\']+\.(?:csv|txt|tsv))["\']', page_html, flags=re.I):
+                href = m.group(1)
+                if href.startswith("http"):
+                    csv_links.append(href)
+            downloaded_csv = None
+            if csv_links:
+                csv_url = csv_links[0]
+                downloaded_csv = await download_file(csv_url)
+                # ---------------------------------------------------------
+# CSV-FIRST: compute numeric answer from CSV sum
+                numeric_answer = None
+                try:
+                    numeric_answer = compute_answer_from_csv(downloaded_csv)
+                    logger.info(f"compute_answer_from_csv returned: {numeric_answer} (from {downloaded_csv})")
+                except Exception:
+                    logger.exception("compute_answer_from_csv failed")
+# ---------------------------------------------------------
+
+            logger.info(f"downloaded CSV: {downloaded_csv}")
+
+            # 4) find audio links
+            audio_links = []
+            for m in re.finditer(r'src=["\']([^"\']+\.(?:opus|mp3|wav|m4a))["\']', page_html, flags=re.I):
+                src = m.group(1)
+                if src.startswith("http"):
+                    audio_links.append(src)
+
+            transcription_text = None
+            if audio_links:
+                audio_url = audio_links[0]
+                logger.info(f"Found audio links: {audio_links}")
+                audio_path = await download_file(audio_url)
+                if audio_path:
+                    logger.info(f"Downloaded audio to {audio_path}, transcribing...")
+                    transcription_text = await asyncio.to_thread(
+                        transcribe_with_whisper_local, audio_path
+                    )
+                    logger.info(f"Local transcription result: {transcription_text}")
+
+            # 5) If transcription looks like an instruction, use CSV + cutoff to compute answer
+            if transcription_text:
+                lower = (transcription_text or "").lower()
+                if any(k in lower for k in ("csv", "cutoff", "column", "sum", "download")):
+                    if not downloaded_csv:
+                        downloaded_csv = find_first_csv_file_in_downloads()
+                        logger.info(f"found recent csv in downloads: {downloaded_csv}")
+                    cutoff = extract_number_from_text(transcription_text)
+                    if downloaded_csv:
+                        numeric_answer = compute_answer_from_csv(downloaded_csv, cutoff=cutoff)
+                        logger.info(f"compute_answer_from_csv returned: {numeric_answer}")
+                    else:
+                        logger.info("No CSV available to compute from transcription instruction")
+                else:
+                    candidate_secret = transcription_text.strip()
+
+            # 6) If still no numeric answer but CSV exists, try compute from CSV only
+            if numeric_answer is None and downloaded_csv:
+                numeric_answer = compute_answer_from_csv(downloaded_csv)
+                logger.info(f"compute_answer_from_csv (no explicit cutoff) returned: {numeric_answer}")
+
+            # 7) Fallback: try to extract a useful number from HTML if needed
+            if numeric_answer is None:
+                numeric_answer = extract_number_from_text(page_html)
+                if numeric_answer is not None:
+                    logger.info(f"extract_number_from_text returned: {numeric_answer}")
+
+            # 8) Build payload
+            # --- normalize numeric answers before building payload ---
+                if numeric_answer is not None and isinstance(numeric_answer, float) and numeric_answer.is_integer():
+                    numeric_answer = int(numeric_answer)
+# ----------------------------------------------------------
+
+                payload = {"email": email, "secret": secret, "url": current_url}
+            if numeric_answer is not None:
+                payload["answer"] = numeric_answer
+            elif candidate_secret:
+                payload["answer"] = candidate_secret
+            else:
+                payload["answer"] = "no-answer-found"
+
+            # 9) Determine submit URL — for demo, always same domain as current_url
+            try:
+                p = urlparse(current_url)
+                submit_url = f"{p.scheme}://{p.netloc}/submit"
+                logger.info(f"Using submit_url {submit_url!r} (host={p.netloc!r})")
+            except Exception:
+                submit_url = None
+
+            if not submit_url:
+                logger.warning("No submit URL could be determined; aborting this page")
+                break
+
+            # <-- ADDITIONAL LOGGING: show exact payload and answer type before posting
+            logger.info(f"Submitting payload (answer type={type(payload.get('answer'))}): {payload}")
+
+            # 10) POST the payload
+            resp = await _post_json(submit_url, payload, timeout=30)
+            logger.info(f"Submit response: {resp}")
+
+            # 11) Interpret response
+            next_url = None
+            if isinstance(resp, dict):
+                if resp.get("correct") is True:
+                    next_url = resp.get("url")
+                elif resp.get("correct") is False:
+                    reason = resp.get("reason")
+                    next_url = resp.get("url")
+                    delay = resp.get("delay", None)
+                    logger.info(f"Server reported incorrect answer: {reason}; next url: {next_url}; delay: {delay}")
+                    if delay:
+                        await asyncio.sleep(float(delay))
+                elif resp.get("_http_error"):
+                    logger.warning(f"Submit HTTP error struct: {resp}")
+                    # can't do much more here
+                    break
+                else:
+                    next_url = resp.get("url") or None
+            else:
+                logger.warning(f"Unexpected submit response type: {type(resp)}; raw: {resp}")
+
+            if not next_url:
+                logger.info(f"Finished processing {start_url}")
+                break
+
+            current_url = next_url
+    except Exception:
+        logger.exception("handle_quiz_request failed")
+    finally:
+        logger.info(f"Finished processing {start_url}")

@@ -1,0 +1,11 @@
+<!doctype html>
+<title>project2-uv</title>
+<h1>/project2-uv</h1>
+<p><strong>Difficulty:</strong> 1 (next URL revealed even if wrong)</p>
+<p><strong>Personalized:</strong> Yes (include your email in the URL).</p>
+<ol>
+  <li>Craft the <em>command string</em> (not the output) using <code>uv http get</code> on <code><span class="origin"></span>/project2/uv.json?email=&lt;your email&gt;</code>.</li>
+  <li>Include header <code>Accept: application/json</code> (e.g., <code>-H "Accept: application/json"</code>).</li>
+  <li>POST that exact command string as <code>answer</code> with <code>url</code> = <code><span class="origin"></span>/project2-uv</code>.</li>
+</ol>
+<script type="module">for (const el of document.querySelectorAll('.origin')) el.textContent = window.location.origin;</script>
